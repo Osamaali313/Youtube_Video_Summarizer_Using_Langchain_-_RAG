@@ -2,17 +2,23 @@
 FastAPI Main Application
 AI-Powered YouTube Video Summarizer with LangGraph Multi-Agent System
 """
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from loguru import logger
+from sqlalchemy.orm import Session
 import sys
 import time
 
 from app.config import settings
 from app.graphs.summary_graph import create_summary_workflow
+from app.models.database import init_db, get_db, create_summary, get_summary
+from app.tools.cache import cache_manager, video_cache
+from app.tools.vector_store import vector_store_manager
+from app.middleware.rate_limit import RateLimitMiddleware
+from app.agents.qa_agent import QAAgent
 
 # Configure logging
 logger.remove()
@@ -39,6 +45,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add rate limiting middleware
+app.add_middleware(RateLimitMiddleware)
 
 
 # =============================================================================
@@ -123,7 +132,7 @@ async def health_check():
 
 
 @app.post("/api/summarize", response_model=SummarizeResponse)
-async def summarize_video(request: SummarizeRequest):
+async def summarize_video(request: SummarizeRequest, db: Session = Depends(get_db)):
     """
     Summarize a YouTube video
 
@@ -131,13 +140,31 @@ async def summarize_video(request: SummarizeRequest):
     1. Extractor Agent: Fetches transcript
     2. Summarizer Agent: Creates intelligent summary
     3. Citation Agent: Adds timestamps (if enabled)
+    4. Research Agent: Adds external context (if enabled)
+    5. Fact-Checker Agent: Verifies claims (if enabled)
 
-    Returns a comprehensive summary with metadata.
+    Returns a comprehensive summary with metadata, stored in database and vector store.
     """
     start_time = time.time()
 
     try:
         logger.info(f"Summarize request: {request.video_url} [{request.mode}]")
+
+        # Extract video ID for caching
+        from app.tools.youtube import extract_video_id
+        video_id = extract_video_id(request.video_url)
+
+        # Check cache first
+        cache_key = f"summary:{video_id}:{request.mode}:{hash(str(request.features))}"
+        cached_result = await video_cache.get(cache_key)
+
+        if cached_result:
+            logger.info(f"Cache hit for {video_id}")
+            return SummarizeResponse(
+                success=True,
+                summary=cached_result.get("summary"),
+                processing_time=0.0
+            )
 
         # Create workflow
         workflow = create_summary_workflow(api_key=request.api_key)
@@ -152,10 +179,55 @@ async def summarize_video(request: SummarizeRequest):
         processing_time = time.time() - start_time
 
         if result.get("success"):
+            summary_data = result.get("summary")
+
+            # Store in vector database for RAG
+            try:
+                vector_store_manager.create_video_collection(
+                    video_id=video_id,
+                    transcript=summary_data.get("transcript", ""),
+                    metadata={
+                        "video_id": video_id,
+                        "title": summary_data.get("title"),
+                        "author": summary_data.get("author")
+                    }
+                )
+                logger.info(f"Vector store created for {video_id}")
+            except Exception as e:
+                logger.warning(f"Failed to create vector store: {e}")
+
+            # Save to database
+            try:
+                import uuid
+                summary_id = str(uuid.uuid4())
+                db_summary = create_summary(db, {
+                    "id": summary_id,
+                    "video_id": video_id,
+                    "video_url": request.video_url,
+                    "video_title": summary_data.get("title"),
+                    "video_author": summary_data.get("author"),
+                    "video_duration": summary_data.get("duration"),
+                    "thumbnail_url": summary_data.get("thumbnail"),
+                    "content": summary_data.get("content", ""),
+                    "mode": request.mode,
+                    "timestamps": summary_data.get("timestamps", []),
+                    "citations": summary_data.get("citations", []),
+                    "processing_time": processing_time,
+                    "credibility_score": summary_data.get("credibility_score"),
+                    "features": request.features
+                })
+                summary_data["id"] = summary_id
+                logger.info(f"Summary saved to database: {summary_id}")
+            except Exception as e:
+                logger.warning(f"Failed to save to database: {e}")
+
+            # Cache the result
+            await video_cache.set(cache_key, {"summary": summary_data})
+
             logger.info(f"Summarization complete in {processing_time:.2f}s")
             return SummarizeResponse(
                 success=True,
-                summary=result.get("summary"),
+                summary=summary_data,
                 processing_time=processing_time
             )
         else:
@@ -178,7 +250,7 @@ async def summarize_video(request: SummarizeRequest):
 
 
 @app.post("/api/question", response_model=QuestionResponse)
-async def ask_question(request: QuestionRequest):
+async def ask_question(request: QuestionRequest, db: Session = Depends(get_db)):
     """
     Ask a question about a summarized video
 
@@ -188,16 +260,33 @@ async def ask_question(request: QuestionRequest):
     try:
         logger.info(f"Q&A request for {request.summary_id}: {request.question}")
 
-        # TODO: Implement Q&A agent with RAG
-        # For now, return a placeholder response
-        return QuestionResponse(
-            answer="Q&A functionality will be available once the RAG system is implemented. "
-                   "This will use vector storage to retrieve relevant context from the video "
-                   "and provide accurate, cited answers.",
-            citations=[],
-            sources=[]
+        # Get summary from database to extract video_id
+        summary = get_summary(db, request.summary_id)
+        if not summary:
+            raise HTTPException(status_code=404, detail="Summary not found")
+
+        video_id = summary.video_id
+
+        # Initialize Q&A agent
+        qa_agent = QAAgent()
+
+        # Answer question using RAG
+        result = await qa_agent.answer_question(
+            video_id=video_id,
+            question=request.question,
+            conversation_history=request.conversation_history or []
         )
 
+        logger.info(f"Q&A complete for {request.summary_id}")
+
+        return QuestionResponse(
+            answer=result.get("answer", ""),
+            citations=result.get("citations", []),
+            sources=result.get("sources", [])
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Q&A error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -385,11 +474,32 @@ async def startup_event():
     logger.info(f"Environment: {settings.ENVIRONMENT}")
     logger.info(f"Default LLM: {settings.DEFAULT_LLM_PROVIDER}/{settings.DEFAULT_MODEL}")
 
+    # Initialize database tables
+    try:
+        init_db()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.warning(f"Database initialization warning: {e}")
+
+    # Connect to Redis cache
+    try:
+        await cache_manager.connect()
+        logger.info("Redis cache connected successfully")
+    except Exception as e:
+        logger.warning(f"Redis connection warning: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Run on application shutdown"""
     logger.info("Shutting down application")
+
+    # Disconnect from Redis
+    try:
+        await cache_manager.disconnect()
+        logger.info("Redis cache disconnected")
+    except Exception as e:
+        logger.warning(f"Redis disconnection warning: {e}")
 
 
 if __name__ == "__main__":
